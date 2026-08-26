@@ -10,6 +10,11 @@ reset sequencing, and the RDY input used by systems such as the Atari 2600.
 Consumers link the CMake target `Forge6502::Core` and implement the two-method
 `forge6502::CpuBus` interface.
 
+## Projects using Forge6502
+
+- [DendyForge](https://github.com/Stizzzly/DendyForge) — NES/Famicom/Dendy emulator
+- [RamboForge](https://github.com/Stizzzly/RamboForge) — Atari 2600 emulator
+
 ```powershell
 cmake --preset mingw-clang-debug
 cmake --build --preset mingw-clang-debug
