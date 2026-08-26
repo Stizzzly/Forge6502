@@ -1,0 +1,1047 @@
+#include <doctest/doctest.h>
+
+#include <array>
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <forge6502/cpu6502.hpp>
+
+namespace
+{
+
+// Records every bus transaction so tests can assert the exact per-cycle
+// read/write order of the sequenced CPU, including hardware dummy reads and
+// the values written by read-modify-write instructions.
+class RecordingCpuBus final : public forge6502::CpuBus
+{
+public:
+    struct Transaction
+    {
+        bool write;
+        std::uint16_t address;
+        std::uint8_t data;
+    };
+
+    std::vector<Transaction> log;
+    std::array<std::uint8_t, 65536> memory{};
+
+    std::uint8_t CpuRead(std::uint16_t address) override
+    {
+        log.push_back({false, address, 0});
+        return memory[address];
+    }
+
+    void CpuWrite(std::uint16_t address, std::uint8_t data) override
+    {
+        log.push_back({true, address, data});
+        memory[address] = data;
+    }
+};
+
+struct CycleMachine
+{
+    RecordingCpuBus bus;
+    forge6502::CPU6502 cpu;
+
+    CycleMachine()
+    {
+        cpu.ConnectBus(&bus);
+        bus.memory[0xFFFC] = 0x00;
+        bus.memory[0xFFFD] = 0x02; // reset into the program page $0200
+        cpu.Reset();
+        while (cpu.Cycles() > 0)
+        {
+            cpu.Clock();
+        }
+        bus.log.clear();
+    }
+
+    // Runs one full instruction and returns the number of cycles it took.
+    int RunInstruction()
+    {
+        int clocks = 0;
+        cpu.Clock();
+        ++clocks;
+        while (cpu.Cycles() > 0)
+        {
+            cpu.Clock();
+            ++clocks;
+        }
+        return clocks;
+    }
+};
+
+std::string FormatLog(const std::vector<RecordingCpuBus::Transaction>& log)
+{
+    std::string text;
+    for (const auto& transaction : log)
+    {
+        if (!text.empty())
+        {
+            text += ' ';
+        }
+        char buffer[16];
+        std::snprintf(buffer, sizeof buffer,
+                      transaction.write ? "W%04X=%02X" : "R%04X",
+                      transaction.address, transaction.data);
+        text += buffer;
+    }
+    return text;
+}
+
+} // namespace
+
+TEST_CASE("Indexed absolute reads touch the unfixed address when crossing")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA2; // LDX #$01
+    machine.bus.memory[0x0201] = 0x01;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0xBD; // LDA $02FF,X
+    machine.bus.memory[0x0201] = 0xFF;
+    machine.bus.memory[0x0202] = 0x02;
+    machine.bus.memory[0x0300] = 0x5A;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 R0202 R0200 R0300");
+    CHECK(clocks == 5);
+    CHECK(machine.cpu.Accumulator() == 0x5A);
+}
+
+TEST_CASE("Indexed absolute reads fetch data once without a page cross")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA2; // LDX #$01
+    machine.bus.memory[0x0201] = 0x01;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0xBD; // LDA $0300,X
+    machine.bus.memory[0x0201] = 0x00;
+    machine.bus.memory[0x0202] = 0x03;
+    machine.bus.memory[0x0301] = 0x42;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 R0202 R0301");
+    CHECK(clocks == 4);
+    CHECK(machine.cpu.Accumulator() == 0x42);
+}
+
+TEST_CASE("Indexed absolute stores dummy-read then write the fixed address")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA9; // LDA #$77
+    machine.bus.memory[0x0201] = 0x77;
+    machine.RunInstruction();
+    machine.cpu.SetProgramCounter(0x0200);
+    machine.bus.memory[0x0200] = 0xA2; // LDX #$02
+    machine.bus.memory[0x0201] = 0x02;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0x9D; // STA $0280,X
+    machine.bus.memory[0x0201] = 0x80;
+    machine.bus.memory[0x0202] = 0x02;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 R0202 R0282 W0282=77");
+    CHECK(clocks == 5);
+    CHECK(machine.bus.memory[0x0282] == 0x77);
+}
+
+TEST_CASE("Indirect Y reads the wrong page before the fixed address")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA0; // LDY #$01
+    machine.bus.memory[0x0201] = 0x01;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0xB1; // LDA ($10),Y
+    machine.bus.memory[0x0201] = 0x10;
+    machine.bus.memory[0x0010] = 0xFF; // pointer lo
+    machine.bus.memory[0x0011] = 0x02; // pointer hi -> base $02FF
+    machine.bus.memory[0x0300] = 0x66;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 R0010 R0011 R0200 R0300");
+    CHECK(clocks == 6);
+    CHECK(machine.cpu.Accumulator() == 0x66);
+}
+
+TEST_CASE("Zero page indexed reads dummy-read the unindexed base")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA2; // LDX #$05
+    machine.bus.memory[0x0201] = 0x05;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0xB5; // LDA $10,X
+    machine.bus.memory[0x0201] = 0x10;
+    machine.bus.memory[0x0015] = 0x3C;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 R0010 R0015");
+    CHECK(clocks == 4);
+    CHECK(machine.cpu.Accumulator() == 0x3C);
+}
+
+TEST_CASE("Implied instructions dummy-read the next opcode address")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xE8; // INX
+    machine.bus.memory[0x0201] = 0xE8; // INX (next)
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201");
+    CHECK(clocks == 2);
+    CHECK(machine.cpu.ProgramCounter() == 0x0201);
+    CHECK(machine.cpu.X() == 0x01);
+}
+
+TEST_CASE("Indexed X indirect reads dummy-read the unindexed pointer")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA2; // LDX #$04
+    machine.bus.memory[0x0201] = 0x04;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0xA1; // LDA ($20,X)
+    machine.bus.memory[0x0201] = 0x20;
+    machine.bus.memory[0x0024] = 0x34; // pointer lo at ($20+$04)
+    machine.bus.memory[0x0025] = 0x05; // pointer hi -> $0534
+    machine.bus.memory[0x0534] = 0x99;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 R0020 R0024 R0025 R0534");
+    CHECK(clocks == 6);
+    CHECK(machine.cpu.Accumulator() == 0x99);
+}
+
+TEST_CASE("JMP indirect wraps the pointer within its page")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0210] = 0x6C; // JMP ($02FF)
+    machine.bus.memory[0x0211] = 0xFF;
+    machine.bus.memory[0x0212] = 0x02;
+    machine.bus.memory[0x02FF] = 0x40; // target lo
+    machine.bus.memory[0x0200] = 0x12; // wrapped high byte comes from $0200
+    machine.bus.memory[0x0300] = 0x90; // wrong page, must not be used
+    machine.cpu.SetProgramCounter(0x0210);
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0210 R0211 R0212 R02FF R0200");
+    CHECK(clocks == 5);
+    CHECK(machine.cpu.ProgramCounter() == 0x1240);
+}
+
+TEST_CASE("Read-modify-write zero page writes the old value before the new one")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xE6; // INC $30
+    machine.bus.memory[0x0201] = 0x30;
+    machine.bus.memory[0x0030] = 0x42;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 R0030 W0030=42 W0030=43");
+    CHECK(clocks == 5);
+    CHECK(machine.bus.memory[0x0030] == 0x43);
+}
+
+TEST_CASE("Read-modify-write zero page indexed dummy-reads the base")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA2; // LDX #$05
+    machine.bus.memory[0x0201] = 0x05;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0x16; // ASL $10,X
+    machine.bus.memory[0x0201] = 0x10;
+    machine.bus.memory[0x0015] = 0xC0;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 R0010 R0015 W0015=C0 W0015=80");
+    CHECK(clocks == 6);
+    CHECK(machine.bus.memory[0x0015] == 0x80);
+    CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::C));
+}
+
+TEST_CASE("Read-modify-write indexed absolute reads the unfixed page first")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA2; // LDX #$F0
+    machine.bus.memory[0x0201] = 0xF0;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0300);
+
+    machine.bus.memory[0x0300] = 0xFE; // INC $0310,X -> effective $0400
+    machine.bus.memory[0x0301] = 0x10;
+    machine.bus.memory[0x0302] = 0x03;
+    machine.bus.memory[0x0400] = 0x10;
+
+    const int clocks = machine.RunInstruction();
+
+    // The unfixed dummy read goes to $0300 (wrong page); the data read,
+    // both writes and the increment use the fixed address.
+    CHECK(FormatLog(machine.bus.log) == "R0300 R0301 R0302 R0300 R0400 W0400=10 W0400=11");
+    CHECK(clocks == 7);
+    CHECK(machine.bus.memory[0x0400] == 0x11);
+}
+
+TEST_CASE("Read-modify-write absolute keeps its six cycles")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xEE; // INC $0400
+    machine.bus.memory[0x0201] = 0x00;
+    machine.bus.memory[0x0202] = 0x04;
+    machine.bus.memory[0x0400] = 0xFF;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 R0202 R0400 W0400=FF W0400=00");
+    CHECK(clocks == 6);
+    CHECK(machine.bus.memory[0x0400] == 0x00);
+    CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::Z));
+}
+
+TEST_CASE("Unofficial SLO follows the same read, write-old, write-new pattern")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA9; // LDA #$40
+    machine.bus.memory[0x0201] = 0x40;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0x07; // SLO $30
+    machine.bus.memory[0x0201] = 0x30;
+    machine.bus.memory[0x0030] = 0xC1;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 R0030 W0030=C1 W0030=82");
+    CHECK(clocks == 5);
+    CHECK(machine.bus.memory[0x0030] == 0x82);
+    CHECK(machine.cpu.Accumulator() == 0xC2); // A |= shifted value
+    CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::C));
+}
+
+TEST_CASE("Unofficial immediate ALU opcodes match their NMOS combinations")
+{
+    SUBCASE("ANC")
+    {
+        CycleMachine machine;
+        machine.bus.memory[0x0200] = 0xA9; // LDA #$80
+        machine.bus.memory[0x0201] = 0x80;
+        machine.bus.memory[0x0202] = 0x0B; // ANC #$FF
+        machine.bus.memory[0x0203] = 0xFF;
+        machine.RunInstruction();
+        machine.RunInstruction();
+
+        CHECK(machine.cpu.Accumulator() == 0x80);
+        CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::C));
+        CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::N));
+    }
+
+    SUBCASE("ALR")
+    {
+        CycleMachine machine;
+        machine.bus.memory[0x0200] = 0xA9; // LDA #$03
+        machine.bus.memory[0x0201] = 0x03;
+        machine.bus.memory[0x0202] = 0x4B; // ALR #$FF
+        machine.bus.memory[0x0203] = 0xFF;
+        machine.RunInstruction();
+        machine.RunInstruction();
+
+        CHECK(machine.cpu.Accumulator() == 0x01);
+        CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::C));
+    }
+
+    SUBCASE("ARR")
+    {
+        CycleMachine machine;
+        machine.bus.memory[0x0200] = 0x38; // SEC
+        machine.bus.memory[0x0201] = 0xA9; // LDA #$FF
+        machine.bus.memory[0x0202] = 0xFF;
+        machine.bus.memory[0x0203] = 0x6B; // ARR #$66
+        machine.bus.memory[0x0204] = 0x66;
+        machine.RunInstruction();
+        machine.RunInstruction();
+        machine.RunInstruction();
+
+        CHECK(machine.cpu.Accumulator() == 0xB3);
+        CHECK_FALSE(machine.cpu.GetFlag(forge6502::CPU6502::Flags::C));
+        CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::V));
+        CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::N));
+    }
+
+    SUBCASE("AXS")
+    {
+        CycleMachine machine;
+        machine.bus.memory[0x0200] = 0xA9; // LDA #$CC
+        machine.bus.memory[0x0201] = 0xCC;
+        machine.bus.memory[0x0202] = 0xA2; // LDX #$0F
+        machine.bus.memory[0x0203] = 0x0F;
+        machine.bus.memory[0x0204] = 0xCB; // AXS #$08
+        machine.bus.memory[0x0205] = 0x08;
+        machine.RunInstruction();
+        machine.RunInstruction();
+        machine.RunInstruction();
+
+        CHECK(machine.cpu.X() == 0x04);
+        CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::C));
+    }
+
+    SUBCASE("XAA")
+    {
+        CycleMachine machine;
+        machine.bus.memory[0x0200] = 0xA2; // LDX #$F3
+        machine.bus.memory[0x0201] = 0xF3;
+        machine.bus.memory[0x0202] = 0x8B; // XAA #$8F
+        machine.bus.memory[0x0203] = 0x8F;
+        machine.RunInstruction();
+        machine.RunInstruction();
+
+        CHECK(machine.cpu.Accumulator() == 0x82);
+        CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::N));
+    }
+
+    SUBCASE("LAX immediate")
+    {
+        CycleMachine machine;
+        machine.bus.memory[0x0200] = 0xAB; // LAX #$3C
+        machine.bus.memory[0x0201] = 0x3C;
+
+        CHECK(machine.RunInstruction() == 2);
+        CHECK(machine.cpu.Accumulator() == 0x3C);
+        CHECK(machine.cpu.X() == 0x3C);
+    }
+}
+
+TEST_CASE("Unofficial LAS and high-byte stores use the indexed bus behavior")
+{
+    SUBCASE("LAS")
+    {
+        CycleMachine machine;
+        machine.bus.memory[0x0200] = 0xA2; // LDX #$F0
+        machine.bus.memory[0x0201] = 0xF0;
+        machine.bus.memory[0x0202] = 0x9A; // TXS
+        machine.bus.memory[0x0203] = 0xA0; // LDY #$01
+        machine.bus.memory[0x0204] = 0x01;
+        machine.bus.memory[0x0205] = 0xBB; // LAS $02FF,Y
+        machine.bus.memory[0x0206] = 0xFF;
+        machine.bus.memory[0x0207] = 0x02;
+        machine.bus.memory[0x0300] = 0xC3;
+        machine.RunInstruction();
+        machine.RunInstruction();
+        machine.RunInstruction();
+        machine.bus.log.clear();
+
+        CHECK(machine.RunInstruction() == 5);
+        CHECK(FormatLog(machine.bus.log) == "R0205 R0206 R0207 R0200 R0300");
+        CHECK(machine.cpu.Accumulator() == 0xC0);
+        CHECK(machine.cpu.X() == 0xC0);
+        CHECK(machine.cpu.StackPointer() == 0xC0);
+    }
+
+    SUBCASE("AHX changes the write address on a page cross")
+    {
+        CycleMachine machine;
+        machine.bus.memory[0x0200] = 0xA9; // LDA #$03
+        machine.bus.memory[0x0201] = 0x03;
+        machine.bus.memory[0x0202] = 0xAA; // TAX
+        machine.bus.memory[0x0203] = 0xA0; // LDY #$01
+        machine.bus.memory[0x0204] = 0x01;
+        machine.RunInstruction();
+        machine.RunInstruction();
+        machine.RunInstruction();
+        machine.bus.log.clear();
+        machine.cpu.SetProgramCounter(0x0300);
+        machine.bus.memory[0x0300] = 0x9F; // AHX $12FF,Y
+        machine.bus.memory[0x0301] = 0xFF;
+        machine.bus.memory[0x0302] = 0x12;
+
+        CHECK(machine.RunInstruction() == 5);
+        CHECK(FormatLog(machine.bus.log) == "R0300 R0301 R0302 R1200 W0300=03");
+        CHECK(machine.bus.memory[0x0300] == 0x03);
+    }
+
+    SUBCASE("AHX indirect Y, TAS, SHY, and SHX store the high-byte mask")
+    {
+        CycleMachine machine;
+        machine.bus.memory[0x0200] = 0xA9; // LDA #$F7
+        machine.bus.memory[0x0201] = 0xF7;
+        machine.bus.memory[0x0202] = 0xAA; // TAX
+        machine.bus.memory[0x0203] = 0xA0; // LDY #$01
+        machine.bus.memory[0x0204] = 0x01;
+        machine.RunInstruction();
+        machine.RunInstruction();
+        machine.RunInstruction();
+
+        machine.bus.memory[0x0205] = 0x93; // AHX ($10),Y
+        machine.bus.memory[0x0206] = 0x10;
+        machine.bus.memory[0x0010] = 0x10;
+        machine.bus.memory[0x0011] = 0x02;
+        machine.cpu.SetProgramCounter(0x0205);
+        CHECK(machine.RunInstruction() == 6);
+        CHECK(machine.bus.memory[0x0211] == 0x03);
+
+        machine.bus.memory[0x0205] = 0x9B; // TAS $0310,Y
+        machine.bus.memory[0x0206] = 0x10;
+        machine.bus.memory[0x0207] = 0x03;
+        machine.cpu.SetProgramCounter(0x0205);
+        CHECK(machine.RunInstruction() == 5);
+        CHECK(machine.bus.memory[0x0311] == 0x04);
+        CHECK(machine.cpu.StackPointer() == 0xF7);
+
+        machine.bus.memory[0x0205] = 0x9C; // SHY $0210,X
+        machine.bus.memory[0x0206] = 0x10;
+        machine.bus.memory[0x0207] = 0x02;
+        machine.cpu.SetProgramCounter(0x0205);
+        CHECK(machine.RunInstruction() == 5);
+        CHECK(machine.bus.memory[0x0211] == 0x03);
+
+        machine.bus.memory[0x0205] = 0x9E; // SHX $0210,Y
+        machine.bus.memory[0x0206] = 0x10;
+        machine.bus.memory[0x0207] = 0x02;
+        machine.cpu.SetProgramCounter(0x0205);
+        CHECK(machine.RunInstruction() == 5);
+        CHECK(machine.bus.memory[0x0211] == 0x03);
+    }
+}
+
+TEST_CASE("Every KIL opcode jams the CPU until reset")
+{
+    for (const std::uint8_t opcode :
+         {0x02, 0x12, 0x22, 0x32, 0x42, 0x52,
+          0x62, 0x72, 0x92, 0xB2, 0xD2, 0xF2})
+    {
+        CycleMachine machine;
+        machine.bus.memory[0x0200] = opcode;
+        machine.bus.memory[0x0201] = 0xEA;
+
+        CHECK(machine.RunInstruction() == 2);
+        CHECK(machine.cpu.IsJammed());
+        CHECK(machine.cpu.ProgramCounter() == 0x0201);
+
+        machine.cpu.IRQ();
+        machine.cpu.NMI();
+        machine.cpu.Clock();
+        CHECK(machine.cpu.ProgramCounter() == 0x0201);
+        CHECK(machine.cpu.IsJammed());
+
+        machine.cpu.Reset();
+        while (machine.cpu.Cycles() > 0)
+        {
+            machine.cpu.Clock();
+        }
+        CHECK_FALSE(machine.cpu.IsJammed());
+    }
+}
+
+TEST_CASE("Every 2A03 opcode has an explicit decoder entry")
+{
+    for (int opcode = 0; opcode <= 0xFF; ++opcode)
+    {
+        CycleMachine machine;
+        machine.bus.memory[0x0200] = static_cast<std::uint8_t>(opcode);
+
+        machine.cpu.Clock(); // opcode-fetch cycle
+        CHECK_MESSAGE(
+            std::string_view(machine.cpu.CurrentInstruction()) != "???",
+            "missing decoder entry for opcode " << opcode);
+    }
+}
+
+TEST_CASE("PHA dummy-reads the next opcode and writes the stack last")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA9; // LDA #$AA
+    machine.bus.memory[0x0201] = 0xAA;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0x48; // PHA
+    machine.bus.memory[0x0201] = 0xEA; // next opcode, dummy-read
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 W01FD=AA");
+    CHECK(clocks == 3);
+    CHECK(machine.cpu.StackPointer() == 0xFC);
+    CHECK(machine.bus.memory[0x01FD] == 0xAA);
+}
+
+TEST_CASE("PHP pushes the status with break and unused bits set")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0x08; // PHP
+    machine.bus.memory[0x0201] = 0xEA;
+
+    const int clocks = machine.RunInstruction();
+
+    // Status after reset is I|U ($24); the pushed byte forces B|U ($34).
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 W01FD=34");
+    CHECK(clocks == 3);
+    CHECK(machine.cpu.StackPointer() == 0xFC);
+}
+
+TEST_CASE("PLA dummy-reads the stack location before pulling")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA9; // LDA #$5A
+    machine.bus.memory[0x0201] = 0x5A;
+    machine.RunInstruction();
+    machine.cpu.SetProgramCounter(0x0200);
+    machine.bus.memory[0x0200] = 0x48; // PHA
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0x68; // PLA
+    machine.bus.memory[0x0201] = 0xEA;
+
+    const int clocks = machine.RunInstruction();
+
+    // Cycle 3 dummy-reads $01FC (pre-increment SP); cycle 4 pulls $01FD.
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 R01FC R01FD");
+    CHECK(clocks == 4);
+    CHECK(machine.cpu.Accumulator() == 0x5A);
+    CHECK(machine.cpu.StackPointer() == 0xFD);
+}
+
+TEST_CASE("PLP restores the pulled status byte")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA9; // LDA #$FF (sets N)
+    machine.bus.memory[0x0201] = 0xFF;
+    machine.RunInstruction();
+    machine.cpu.SetProgramCounter(0x0200);
+    machine.bus.memory[0x0200] = 0x08; // PHP (pushes N|I|U plus B|U)
+    machine.RunInstruction();
+    machine.cpu.SetProgramCounter(0x0200);
+    machine.bus.memory[0x0200] = 0xA9; // LDA #$00 (clears N)
+    machine.bus.memory[0x0201] = 0x00;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0x28; // PLP
+    machine.bus.memory[0x0201] = 0xEA;
+
+    const int clocks = machine.RunInstruction();
+
+    // Cycle 3 dummy-reads $01FC (pre-increment SP); cycle 4 pulls $01FD.
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 R01FC R01FD");
+    CHECK(clocks == 4);
+    CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::N));
+    CHECK_FALSE(machine.cpu.GetFlag(forge6502::CPU6502::Flags::B));
+    CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::U));
+}
+
+TEST_CASE("JSR pushes the return address before reading the target high byte")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0x20; // JSR $0500
+    machine.bus.memory[0x0201] = 0x00;
+    machine.bus.memory[0x0202] = 0x05;
+
+    const int clocks = machine.RunInstruction();
+
+    // The dummy stack read, both pushes of the return address $0202 (the
+    // address of the high operand byte), then the high-byte fetch at $0202.
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 R01FD W01FD=02 W01FC=02 R0202");
+    CHECK(clocks == 6);
+    CHECK(machine.cpu.ProgramCounter() == 0x0500);
+    CHECK(machine.cpu.StackPointer() == 0xFB);
+    CHECK(machine.bus.memory[0x01FD] == 0x02);
+    CHECK(machine.bus.memory[0x01FC] == 0x02);
+}
+
+TEST_CASE("RTS pulls the return address and increments internally")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0x20; // JSR $0500
+    machine.bus.memory[0x0201] = 0x00;
+    machine.bus.memory[0x0202] = 0x05;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+
+    machine.bus.memory[0x0500] = 0x60; // RTS
+
+    const int clocks = machine.RunInstruction();
+
+    // The sixth cycle only increments the pulled PC; no bus transaction.
+    CHECK(FormatLog(machine.bus.log) == "R0500 R0501 R01FB R01FC R01FD");
+    CHECK(clocks == 6);
+    CHECK(machine.cpu.ProgramCounter() == 0x0203);
+    CHECK(machine.cpu.StackPointer() == 0xFD);
+}
+
+TEST_CASE("RTI pulls status and return address across six cycles")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0x08; // PHP
+    machine.RunInstruction();
+    machine.cpu.SetProgramCounter(0x0200);
+    machine.bus.memory[0x0200] = 0x08; // PHP (SP now $FB)
+    machine.RunInstruction();
+    machine.bus.memory[0x01FC] = 0x24; // pulled status (I|U)
+    machine.bus.memory[0x01FD] = 0x00; // return PCL
+    machine.bus.memory[0x01FE] = 0x03; // return PCH
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0600);
+
+    machine.bus.memory[0x0600] = 0x40; // RTI
+    machine.bus.memory[0x0601] = 0xEA;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0600 R0601 R01FB R01FC R01FD R01FE");
+    CHECK(clocks == 6);
+    CHECK(machine.cpu.ProgramCounter() == 0x0300);
+    CHECK(machine.cpu.StackPointer() == 0xFE);
+    CHECK(machine.cpu.Status() == 0x24);
+}
+
+TEST_CASE("BRK pushes the padded return address and reads the IRQ vector")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0x00; // BRK
+    machine.bus.memory[0x0201] = 0xEA; // padding byte, consumed by cycle 2
+    machine.bus.memory[0xFFFE] = 0x34; // IRQ vector $1234
+    machine.bus.memory[0xFFFF] = 0x12;
+
+    const int clocks = machine.RunInstruction();
+
+    // Status after reset is I|U ($24); BRK pushes it with B|U forced ($34).
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 W01FD=02 W01FC=02 W01FB=34 RFFFE RFFFF");
+    CHECK(clocks == 7);
+    CHECK(machine.cpu.ProgramCounter() == 0x1234);
+    CHECK(machine.cpu.StackPointer() == 0xFA);
+    CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::I));
+    CHECK_FALSE(machine.cpu.GetFlag(forge6502::CPU6502::Flags::B));
+}
+
+TEST_CASE("Accumulator shifts perform the implied dummy read")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA9; // LDA #$40
+    machine.bus.memory[0x0201] = 0x40;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0x0A; // ASL A
+    machine.bus.memory[0x0201] = 0xEA;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201");
+    CHECK(clocks == 2);
+    CHECK(machine.cpu.Accumulator() == 0x80);
+    CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::N));
+}
+
+TEST_CASE("Sequenced stores perform one bus transaction per cycle")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA9; // LDA #$77
+    machine.bus.memory[0x0201] = 0x77;
+    machine.RunInstruction();
+    machine.cpu.SetProgramCounter(0x0200);
+    machine.bus.memory[0x0200] = 0xA2; // LDX #$02
+    machine.bus.memory[0x0201] = 0x02;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0x9D; // STA $0280,X
+    machine.bus.memory[0x0201] = 0x80;
+    machine.bus.memory[0x0202] = 0x02;
+
+    int clocks = 0;
+    std::size_t previousSize = 0;
+    do
+    {
+        machine.cpu.Clock();
+        ++clocks;
+        CHECK(machine.bus.log.size() - previousSize == 1);
+        previousSize = machine.bus.log.size();
+    } while (machine.cpu.Cycles() > 0);
+
+    CHECK(clocks == 5);
+    CHECK(machine.bus.log.size() == 5);
+    CHECK(machine.bus.log.back().write);
+    CHECK(machine.bus.memory[0x0282] == 0x77);
+}
+
+TEST_CASE("A not-taken branch reads only the opcode and operand")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA9; // LDA #$00 sets Z
+    machine.bus.memory[0x0201] = 0x00;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0xD0; // BNE +05 (not taken)
+    machine.bus.memory[0x0201] = 0x05;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201");
+    CHECK(clocks == 2);
+    CHECK(machine.cpu.ProgramCounter() == 0x0202);
+}
+
+TEST_CASE("A taken branch dummy-fetches the next opcode before redirecting")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA9; // LDA #$01 clears Z
+    machine.bus.memory[0x0201] = 0x01;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0200);
+
+    machine.bus.memory[0x0200] = 0xD0; // BNE +05 (taken, same page)
+    machine.bus.memory[0x0201] = 0x05;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201 R0202");
+    CHECK(clocks == 3);
+    CHECK(machine.cpu.ProgramCounter() == 0x0207);
+}
+
+TEST_CASE("A taken branch crossing a page spends its fourth cycle internally")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA9; // LDA #$01 clears Z
+    machine.bus.memory[0x0201] = 0x01;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x02F0);
+
+    machine.bus.memory[0x02F0] = 0xD0; // BNE +0F: $02F2 -> $0301
+    machine.bus.memory[0x02F1] = 0x0F;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R02F0 R02F1 R02F2");
+    CHECK(clocks == 4);
+    CHECK(machine.bus.log.size() == 3);
+    CHECK(machine.cpu.ProgramCounter() == 0x0301);
+}
+
+TEST_CASE("A backward taken branch crossing a page also takes four cycles")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0xA9; // LDA #$01 clears Z
+    machine.bus.memory[0x0201] = 0x01;
+    machine.RunInstruction();
+    machine.bus.log.clear();
+    machine.cpu.SetProgramCounter(0x0300);
+
+    machine.bus.memory[0x0300] = 0xD0; // BNE -03: $0302 -> $02FF
+    machine.bus.memory[0x0301] = 0xFD;
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) == "R0300 R0301 R0302");
+    CHECK(clocks == 4);
+    CHECK(machine.bus.log.size() == 3);
+    CHECK(machine.cpu.ProgramCounter() == 0x02FF);
+}
+
+TEST_CASE("Hardware IRQ entry runs the seven-cycle sequence")
+{
+    CycleMachine machine;
+    machine.bus.memory[0xFFFE] = 0x10; // IRQ vector $0310
+    machine.bus.memory[0xFFFF] = 0x03;
+    machine.bus.memory[0x0200] = 0xEA; // NOP: the intervening instruction
+    machine.cpu.SetProgramCounter(0x0200);
+    machine.cpu.SetFlag(forge6502::CPU6502::Flags::I, false);
+    machine.bus.log.clear();
+
+    machine.cpu.IRQ();
+    const int precedingClocks = machine.RunInstruction();
+
+    CHECK(precedingClocks == 2);
+    CHECK(FormatLog(machine.bus.log) == "R0200 R0201");
+    machine.bus.log.clear();
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) ==
+          "R0201 R0201 W01FD=02 W01FC=01 W01FB=20 RFFFE RFFFF");
+    CHECK(clocks == 7);
+    CHECK(machine.cpu.ProgramCounter() == 0x0310);
+    CHECK(machine.cpu.StackPointer() == 0xFA);
+    CHECK(machine.cpu.GetFlag(forge6502::CPU6502::Flags::I));
+}
+
+TEST_CASE("NMI entry uses the NMI vector and bypasses the I flag")
+{
+    CycleMachine machine;
+    machine.bus.memory[0xFFFA] = 0x50; // NMI vector $0450
+    machine.bus.memory[0xFFFB] = 0x04;
+    machine.bus.memory[0x0200] = 0xEA; // NOP: the intervening instruction
+    machine.cpu.SetProgramCounter(0x0200);
+    machine.cpu.SetFlag(forge6502::CPU6502::Flags::I, true);
+    machine.bus.log.clear();
+
+    machine.cpu.NMI();
+    machine.RunInstruction();
+    machine.bus.log.clear();
+
+    const int clocks = machine.RunInstruction();
+
+    CHECK(FormatLog(machine.bus.log) ==
+          "R0201 R0201 W01FD=02 W01FC=01 W01FB=24 RFFFA RFFFB");
+    CHECK(clocks == 7);
+    CHECK(machine.cpu.ProgramCounter() == 0x0450);
+    CHECK(machine.cpu.StackPointer() == 0xFA);
+}
+
+TEST_CASE("NMI latched during BRK takes over BRK's vector fetch")
+{
+    CycleMachine machine;
+    machine.bus.memory[0x0200] = 0x00; // BRK
+    machine.bus.memory[0x0201] = 0xEA; // BRK padding byte
+    machine.bus.memory[0xFFFA] = 0x50; // NMI vector $0450
+    machine.bus.memory[0xFFFB] = 0x04;
+    machine.bus.memory[0xFFFE] = 0x10; // IRQ vector $0310
+    machine.bus.memory[0xFFFF] = 0x03;
+    machine.cpu.SetProgramCounter(0x0200);
+    machine.bus.log.clear();
+
+    machine.cpu.Clock(); // BRK opcode fetch
+    machine.cpu.Clock(); // padding-byte fetch
+    machine.cpu.Clock(); // push return-address high byte
+    machine.cpu.Clock(); // push return-address low byte
+    machine.cpu.NMI();
+    machine.cpu.Clock(); // BRK status push (with B set)
+    machine.cpu.Clock(); // NMI vector low byte
+    machine.cpu.Clock(); // NMI vector high byte
+
+    CHECK(FormatLog(machine.bus.log) ==
+          "R0200 R0201 W01FD=02 W01FC=02 W01FB=34 RFFFA RFFFB");
+    CHECK(machine.cpu.ProgramCounter() == 0x0450);
+    CHECK(machine.cpu.StackPointer() == 0xFA);
+
+    // The pending NMI was consumed by BRK; no second interrupt entry follows.
+    machine.bus.memory[0x0450] = 0xEA;
+    machine.bus.log.clear();
+    CHECK(machine.RunInstruction() == 2);
+    CHECK(FormatLog(machine.bus.log) == "R0450 R0451");
+}
+
+TEST_CASE("Reset performs seven dummy-read cycles and reloads the vector")
+{
+    RecordingCpuBus bus;
+    bus.memory[0xFFFC] = 0x00;
+    bus.memory[0xFFFD] = 0x02;
+
+    forge6502::CPU6502 cpu;
+    cpu.ConnectBus(&bus);
+    cpu.Reset();
+    CHECK(cpu.Cycles() == 7);
+
+    int clocks = 0;
+    while (cpu.Cycles() > 0)
+    {
+        cpu.Clock();
+        ++clocks;
+    }
+
+    CHECK(clocks == 7);
+    CHECK(FormatLog(bus.log) ==
+          "R0000 R0000 R0100 R01FF R01FE RFFFC RFFFD");
+    CHECK(cpu.StackPointer() == 0xFD);
+    CHECK(cpu.ProgramCounter() == 0x0200);
+    CHECK(cpu.GetFlag(forge6502::CPU6502::Flags::I));
+}
+
+TEST_CASE("Interrupt recognition follows the penultimate-cycle poll")
+{
+    CycleMachine machine;
+    machine.bus.memory[0xFFFE] = 0x10; // IRQ vector $0310
+    machine.bus.memory[0xFFFF] = 0x03;
+    machine.bus.memory[0x0200] = 0xA5; // LDA $10 (3 cycles)
+    machine.bus.memory[0x0201] = 0x10;
+    machine.bus.memory[0x0202] = 0xEA; // NOP
+    machine.bus.memory[0x0010] = 0x5A;
+    machine.cpu.SetProgramCounter(0x0200);
+    machine.cpu.SetFlag(forge6502::CPU6502::Flags::I, false);
+
+    // The line rises before the poll (cycle 2 of 3): entry begins at
+    // this instruction's own boundary.
+    machine.cpu.Clock(); // cycle 1: opcode fetch
+    machine.cpu.IRQ();
+    machine.cpu.Clock(); // cycle 2: operand; the poll samples at its end
+    machine.cpu.Clock(); // cycle 3: data read
+    machine.cpu.Clock(); // boundary: interrupt-entry cycle 1
+    CHECK(machine.cpu.Cycles() == 6);
+    CHECK(machine.cpu.Accumulator() == 0x5A);
+    while (machine.cpu.Cycles() > 0)
+    {
+        machine.cpu.Clock();
+    }
+    CHECK(machine.cpu.ProgramCounter() == 0x0310);
+
+    // The line rises only at the boundary, after LDA's final-cycle poll:
+    // one more whole instruction passes before the entry sequence.
+    CycleMachine late;
+    late.bus.memory[0xFFFE] = 0x10;
+    late.bus.memory[0xFFFF] = 0x03;
+    late.bus.memory[0x0200] = 0xA5; // LDA $10 (3 cycles)
+    late.bus.memory[0x0201] = 0x10;
+    late.bus.memory[0x0202] = 0xEA; // NOP: the deferred instruction
+    late.cpu.SetProgramCounter(0x0200);
+    late.cpu.SetFlag(forge6502::CPU6502::Flags::I, false);
+
+    late.cpu.Clock(); // cycle 1
+    late.cpu.Clock(); // cycle 2
+    late.cpu.Clock(); // cycle 3 completes LDA; its poll saw no line
+    CHECK(late.cpu.Cycles() == 0);
+    late.cpu.IRQ(); // the line rises at the boundary, after LDA's poll
+    late.cpu.Clock(); // the NOP begins
+    CHECK(late.cpu.Cycles() == 1);
+    late.cpu.Clock(); // NOP cycle 2: its final-cycle poll samples the line
+    late.cpu.Clock(); // boundary: interrupt-entry cycle 1
+    CHECK(late.cpu.Cycles() == 6);
+    CHECK(late.cpu.ProgramCounter() == 0x0203); // still before the vector
+    while (late.cpu.Cycles() > 0)
+    {
+        late.cpu.Clock();
+    }
+    CHECK(late.cpu.ProgramCounter() == 0x0310);
+}
