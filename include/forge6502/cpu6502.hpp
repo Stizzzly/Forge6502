@@ -316,6 +316,7 @@ private:
     CpuBus* m_bus{nullptr};
     bool m_decimalModeEnabled{true};
     bool m_readyLine{true};
+    bool m_readyStalledCurrentInstruction{false};
     bool m_cyclePerformedWrite{false};
 
     // Registers
@@ -345,6 +346,7 @@ private:
     // cycle; the sequencer performs the taken branch's dummy fetch and PC
     // update on the next cycle.
     bool m_branchTaken{false};
+    bool m_branchPageCrossed{false};
     bool m_jammed{false};
 
     // Hardware polls interrupt lines at an instruction boundary, so a
@@ -363,6 +365,7 @@ private:
     // instruction (phi2); the sampled state decides at the following
     // boundary whether the seven-cycle entry begins.
     PendingInterrupt m_recognizedInterrupt{PendingInterrupt::None};
+    bool m_interruptPollHeldByReady{false};
 
     SpecialSequence m_specialSequence{SpecialSequence::None};
     std::uint16_t m_interruptVector{0};

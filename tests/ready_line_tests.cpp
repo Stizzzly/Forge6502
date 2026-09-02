@@ -98,3 +98,38 @@ TEST_CASE("RDY low does not suppress the final write cycle")
     CHECK(bus.lastWrite == 0x0080);
     CHECK(cpu.IsInstructionBoundary());
 }
+
+TEST_CASE("RDY stall removes the H mask from unstable high-byte stores")
+{
+    RecordingBus bus;
+    bus.memory[0xFFFC] = 0x00;
+    bus.memory[0xFFFD] = 0x80;
+    bus.memory[0x8000] = 0xA2; // LDX #$A5
+    bus.memory[0x8001] = 0xA5;
+    bus.memory[0x8002] = 0xA0; // LDY #$00
+    bus.memory[0x8003] = 0x00;
+    bus.memory[0x8004] = 0x9E; // SHX $0500,Y
+    bus.memory[0x8005] = 0x00;
+    bus.memory[0x8006] = 0x05;
+
+    forge6502::CPU6502 cpu;
+    cpu.ConnectBus(&bus);
+    cpu.Reset();
+    CompleteReset(cpu);
+    while (cpu.ProgramCounter() != 0x8004 || !cpu.IsInstructionBoundary())
+    {
+        cpu.Clock();
+    }
+
+    cpu.Clock(); // opcode
+    cpu.Clock(); // low operand
+    cpu.Clock(); // high operand
+    cpu.ReadyLine(false);
+    cpu.Clock(); // stretched indexed dummy read
+    cpu.ReadyLine(true);
+    cpu.Clock(); // repeated indexed dummy read
+    cpu.Clock(); // write
+
+    CHECK(bus.memory[0x0500] == 0xA5);
+    CHECK(cpu.IsInstructionBoundary());
+}

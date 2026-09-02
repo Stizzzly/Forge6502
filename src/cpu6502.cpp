@@ -594,9 +594,11 @@ void CPU6502::Reset()
     m_stepCycle = 0;
     m_operandReady = false;
     m_branchTaken = false;
+    m_branchPageCrossed = false;
     m_jammed = false;
     m_pendingInterrupt = PendingInterrupt::None;
     m_recognizedInterrupt = PendingInterrupt::None;
+    m_interruptPollHeldByReady = false;
     m_specialSequence = SpecialSequence::Reset;
     m_cycles = 7;
 }
@@ -625,13 +627,29 @@ void CPU6502::Clock()
     // instruction. The I flag masks IRQ at the poll itself, so a line
     // latched while I was clear (for example during an earlier entry
     // sequence, before I is set) cannot re-trigger inside the handler.
-    if (m_cycles == 1 && m_specialSequence == SpecialSequence::None)
+    const bool branchFinalCycle =
+        m_executionKind == ExecutionKind::Branch && m_branchTaken &&
+        m_cycles == 1;
+    const bool branchPageCrossPoll =
+        branchFinalCycle && m_branchPageCrossed;
+    const bool interruptPollCycle =
+        m_specialSequence == SpecialSequence::None &&
+        m_executionKind != ExecutionKind::Brk &&
+        ((m_cycles == 1 && !branchFinalCycle) || branchPageCrossPoll);
+    if (interruptPollCycle && !m_interruptPollHeldByReady)
     {
-        m_recognizedInterrupt = m_pendingInterrupt;
-        if (m_recognizedInterrupt == PendingInterrupt::Irq &&
-            GetFlag(Flags::I))
+        PendingInterrupt sampledInterrupt = m_pendingInterrupt;
+        if (sampledInterrupt == PendingInterrupt::Irq && GetFlag(Flags::I))
         {
-            m_recognizedInterrupt = PendingInterrupt::None;
+            sampledInterrupt = PendingInterrupt::None;
+        }
+
+        // A page-crossing branch has two poll points. Once the first one
+        // recognizes an interrupt, a deasserted line at the second poll
+        // cannot revoke it; a later NMI may still take priority.
+        if (!branchPageCrossPoll || sampledInterrupt != PendingInterrupt::None)
+        {
+            m_recognizedInterrupt = sampledInterrupt;
         }
     }
 
@@ -659,7 +677,24 @@ void CPU6502::Clock()
 
     if (!m_readyLine && !m_cyclePerformedWrite)
     {
+        const PendingInterrupt sampledInterrupt = m_recognizedInterrupt;
         *this = beforeCycle;
+        if (interruptPollCycle)
+        {
+            // RDY repeats the bus read, not the interrupt-polling window.
+            // Preserve the first sample so an IRQ arriving during DMC DMA
+            // cannot retroactively change a branch's cycle-2 poll.
+            m_recognizedInterrupt = sampledInterrupt;
+            m_interruptPollHeldByReady = true;
+        }
+        if (beforeCycle.m_cycles != 0)
+        {
+            m_readyStalledCurrentInstruction = true;
+        }
+    }
+    else
+    {
+        m_interruptPollHeldByReady = false;
     }
 }
 
@@ -776,6 +811,7 @@ CPU6502::ExecutionKind CPU6502::ClassifyExecution(
 void CPU6502::BeginInstruction()
 {
     Fetch();
+    m_readyStalledCurrentInstruction = false;
 
     m_currentInstruction = &GetInstructionConfig(m_opcode);
     const auto& instruction = *m_currentInstruction;
@@ -914,8 +950,9 @@ void CPU6502::StepInstruction()
         }
         else
         {
-            // Internal cycle: the pulled address is incremented past the
-            // subroutine's high-byte slot without a bus access.
+            // The final cycle reads the pulled return address, then advances
+            // past the subroutine's high-byte operand.
+            Read(m_pc);
             ++m_pc;
         }
         break;
@@ -962,19 +999,9 @@ void CPU6502::StepInstruction()
         }
         else if (cycle == 5)
         {
-            Push(m_status | static_cast<std::uint8_t>(Flags::B) |
-                 static_cast<std::uint8_t>(Flags::U));
-            SetFlag(Flags::B, false);
-            SetFlag(Flags::U, true);
-            SetFlag(Flags::I, true);
-        }
-        else if (cycle == 6)
-        {
-            // An NMI latched while BRK is in progress takes over BRK's
-            // vector fetch. The BRK stack frame has already been written,
-            // including B=1, so RTI returns through the BRK padding byte.
-            // This is the NMOS/2A03 "NMI interrupts BRK" edge case covered
-            // by blargg cpu_interrupts_v2.
+            // The vector-select signal settles between cycles 4 and 5.
+            // A later NMI does not change this BRK's vector and must wait
+            // until an instruction in the handler performs a normal poll.
             m_interruptVector = m_pendingInterrupt == PendingInterrupt::Nmi
                 ? 0xFFFA
                 : 0xFFFE;
@@ -983,6 +1010,14 @@ void CPU6502::StepInstruction()
                 m_pendingInterrupt = PendingInterrupt::None;
                 m_recognizedInterrupt = PendingInterrupt::None;
             }
+            Push(m_status | static_cast<std::uint8_t>(Flags::B) |
+                 static_cast<std::uint8_t>(Flags::U));
+            SetFlag(Flags::B, false);
+            SetFlag(Flags::U, true);
+            SetFlag(Flags::I, true);
+        }
+        else if (cycle == 6)
+        {
             m_addrAbs = Read(m_interruptVector);
         }
         else
@@ -1005,6 +1040,7 @@ void CPU6502::StepInstruction()
                 m_addrRel |= 0xFF00;
             }
             m_branchTaken = false;
+            m_branchPageCrossed = false;
             RunOperate(instruction);
             if (m_branchTaken)
             {
@@ -1013,6 +1049,7 @@ void CPU6502::StepInstruction()
                     static_cast<std::uint16_t>(m_pc + m_addrRel);
                 if ((targetAddress & 0xFF00) != (m_pc & 0xFF00))
                 {
+                    m_branchPageCrossed = true;
                     ++m_cycles;
                 }
             }
@@ -1022,9 +1059,24 @@ void CPU6502::StepInstruction()
             // Dummy fetch of the next opcode address; the byte is
             // discarded and PC still points there while the offset lands.
             Read(m_pc);
-            m_pc = static_cast<std::uint16_t>(m_pc + m_addrRel);
+            m_addrAbs = static_cast<std::uint16_t>(m_pc + m_addrRel);
+            if ((m_addrAbs & 0xFF00) != (m_pc & 0xFF00))
+            {
+                // The low adder settles first. Cycle 4 exposes the target's
+                // new low byte with the old high byte on the address bus.
+                m_pc = static_cast<std::uint16_t>(
+                    (m_pc & 0xFF00) | (m_addrAbs & 0x00FF));
+            }
+            else
+            {
+                m_pc = m_addrAbs;
+            }
         }
-        // The page-cross fix-up cycle is internal: no bus transaction.
+        else if (cycle == 4)
+        {
+            Read(m_pc);
+            m_pc = m_addrAbs;
+        }
         break;
 
     case ExecutionKind::Jam:
@@ -1835,6 +1887,16 @@ std::uint8_t CPU6502::LAS()
 
 void CPU6502::StoreHighIndexed(std::uint8_t value)
 {
+    if (m_readyStalledCurrentInstruction)
+    {
+        // On NMOS parts, pulling RDY low during the final indexed read
+        // prevents the unstable high-byte-store opcodes from applying H+1.
+        // SHX/SHY consequently behave like STX/STY, and AHX/TAS store their
+        // unmasked register value at the normally indexed address.
+        Write(m_addrAbs, value);
+        return;
+    }
+
     const bool pageCrossed =
         (m_addrAbs & 0xFF00) != (m_addrBase & 0xFF00);
     std::uint8_t addressHigh = static_cast<std::uint8_t>(m_addrAbs >> 8);
@@ -2378,10 +2440,21 @@ void CPU6502::BranchIf(bool condition)
 // Clock() call.
 void CPU6502::BeginInterruptEntry()
 {
-    m_interruptVector = m_recognizedInterrupt == PendingInterrupt::Nmi
+    const PendingInterrupt recognizedInterrupt = m_recognizedInterrupt;
+    m_interruptVector = recognizedInterrupt == PendingInterrupt::Nmi
                             ? 0xFFFA
                             : 0xFFFE;
-    m_pendingInterrupt = PendingInterrupt::None;
+
+    // An NMI edge may arrive after IRQ was recognized at the preceding
+    // instruction's poll but before the first interrupt-entry cycle. It
+    // must remain latched so it can hijack this IRQ's vector fetch. Clear
+    // the pending source only when it is the interrupt being consumed (or
+    // a repeated level-triggered IRQ), never when it is that newer NMI.
+    if (recognizedInterrupt == PendingInterrupt::Nmi ||
+        m_pendingInterrupt != PendingInterrupt::Nmi)
+    {
+        m_pendingInterrupt = PendingInterrupt::None;
+    }
     m_recognizedInterrupt = PendingInterrupt::None;
 
     m_specialSequence = SpecialSequence::InterruptEntry;
@@ -2419,6 +2492,14 @@ void CPU6502::StepSpecialSequence()
             Push(static_cast<std::uint8_t>(m_pc & 0x00FF));
             break;
         case 5:
+            if (m_interruptVector != 0xFFFA &&
+                m_pendingInterrupt == PendingInterrupt::Nmi)
+            {
+                // IRQ and BRK share the same vector-selection timing: NMI
+                // can hijack only through the end of cycle 4.
+                m_interruptVector = 0xFFFA;
+                m_pendingInterrupt = PendingInterrupt::None;
+            }
             Push(static_cast<std::uint8_t>(
                 (m_status & ~static_cast<std::uint8_t>(Flags::B)) |
                 static_cast<std::uint8_t>(Flags::U)));
